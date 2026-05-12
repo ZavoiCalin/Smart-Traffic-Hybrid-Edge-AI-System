@@ -2,9 +2,11 @@
 
 ## Overview
 
-Smart Traffic Management (Hybrid Edge AI Edition) is an intelligent traffic monitoring and optimization platform that combines edge AI processing with cloud-based analytics.
+Smart Traffic Hybrid Edge AI System is a solution that uses high-performance edge processing and computer vision to determine the most optimal traffic routes in real time.
 
-The system performs real-time vehicle detection, traffic analysis, and adaptive signal control directly at intersections while synchronizing data with the cloud for centralized monitoring and optimization.
+The platform analyzes live video streams from traffic cameras using Edge AI inference to detect vehicles, monitor congestion levels, estimate traffic flow, and dynamically optimize routing and signal timing.
+
+By combining low-latency edge computing with cloud-based analytics, the system enables faster decision-making, reduced congestion, improved emergency response routing, and scalable smart city traffic management.
 
 ---
 
