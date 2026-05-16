@@ -1,4 +1,5 @@
 #include "gateway.hpp"
+#include "router.hpp"
 #include <iostream>
 #include <thread>
 #include <chrono>
@@ -6,99 +7,92 @@
 #include <filesystem>
 #include <fstream>
 #include <sstream>
-#include <functional>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
+#include <cstdlib>
+#include "iothub.h"
+#include "iothubtransportmqtt.h"
+#include "iothub_device_client_ll.h"
+#include "iothub_message.h"
 
 static std::atomic<bool> g_run{true};
 
-static void extract_json_objects(const std::string& s, const std::function<void(const std::string&)>& cb)
+static IOTHUB_DEVICE_CLIENT_LL_HANDLE g_iotHubClient = nullptr;
+static std::atomic<bool> g_iotHubInitialized{false};
+
+static std::string gateway_intersection_id()
 {
-    size_t i = 0;
-    while (i < s.size())
+    const char* env = std::getenv("GATEWAY_INTERSECTION_ID");
+    return (env && env[0]) ? std::string(env) : "gateway-1";
+}
+
+static void iothub_send_confirmation_callback(IOTHUB_CLIENT_CONFIRMATION_RESULT result, void*)
+{
+    std::cout << "Azure IoT Hub send confirmation: " << result << std::endl;
+}
+
+static bool init_iot_hub_client()
+{
+    if (g_iotHubClient)
+        return true;
+
+    const char* connectionString = std::getenv("AZURE_IOT_HUB_CONNECTION_STRING");
+    if (connectionString == nullptr || connectionString[0] == '\0')
     {
-        size_t start = s.find('{', i);
-        if (start == std::string::npos) break;
+        std::cerr << "AZURE_IOT_HUB_CONNECTION_STRING is not set" << std::endl;
+        return false;
+    }
 
-        int depth = 0;
-        size_t j = start;
-        for (; j < s.size(); ++j)
-        {
-            if (s[j] == '{') ++depth;
-            else if (s[j] == '}')
-            {
-                --depth;
-                if (depth == 0)
-                    break;
-            }
-        }
+    IoTHub_Init();
 
-        if (depth == 0 && j < s.size())
-        {
-            cb(s.substr(start, j - start + 1));
-            i = j + 1;
-        }
-        else
-        {
-            break;
-        }
+    g_iotHubClient = IoTHubDeviceClient_LL_CreateFromConnectionString(connectionString, MQTT_Protocol);
+    if (!g_iotHubClient)
+    {
+        std::cerr << "Failed to create IoT Hub client" << std::endl;
+        IoTHub_Deinit();
+        return false;
+    }
+
+    int messageTimeout = 240000;
+    IoTHubDeviceClient_LL_SetOption(g_iotHubClient, "messageTimeout", &messageTimeout);
+    g_iotHubInitialized.store(true);
+    return true;
+}
+
+static void cleanup_iot_hub_client()
+{
+    if (g_iotHubClient)
+    {
+        IoTHubDeviceClient_LL_Destroy(g_iotHubClient);
+        g_iotHubClient = nullptr;
+    }
+    if (g_iotHubInitialized.exchange(false))
+    {
+        IoTHub_Deinit();
     }
 }
 
-static std::string extract_intersection_id(const std::string& json)
+static bool send_iot_hub_message(const std::string& payload)
 {
-    size_t first_quote = json.find('"');
-    if (first_quote == std::string::npos) return {};
-    size_t second_quote = json.find('"', first_quote + 1);
-    if (second_quote == std::string::npos) return {};
-    return json.substr(first_quote + 1, second_quote - first_quote - 1);
-}
+    if (!init_iot_hub_client())
+        return false;
 
-static void merge_jetson_logs(const std::filesystem::path& jetsonLogsDir,
-                              const std::filesystem::path& outputJsonlPath)
-{
-    std::error_code ec;
-    std::filesystem::create_directories(outputJsonlPath.parent_path(), ec);
+    IOTHUB_MESSAGE_HANDLE messageHandle = IoTHubMessage_CreateFromString(payload.c_str());
+    if (!messageHandle)
+        return false;
 
-    std::ofstream ofs(outputJsonlPath, std::ios::trunc);
-    if (!ofs) return;
+    auto result = IoTHubDeviceClient_LL_SendEventAsync(g_iotHubClient, messageHandle, iothub_send_confirmation_callback, nullptr);
+    IoTHubMessage_Destroy(messageHandle);
 
-    for (const auto& entry : std::filesystem::directory_iterator(jetsonLogsDir, ec))
+    if (result != IOTHUB_CLIENT_OK)
     {
-        if (ec || !entry.is_regular_file()) continue;
-        if (entry.path().extension() != ".json") continue;
-
-        std::ifstream ifs(entry.path());
-        if (!ifs) continue;
-
-        std::string content((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
-        std::string intersectionId = extract_intersection_id(content);
-        if (intersectionId.empty()) continue;
-
-        size_t arrayStart = content.find('[', content.find(intersectionId));
-        if (arrayStart == std::string::npos) continue;
-
-        int depth = 0;
-        size_t arrayEnd = arrayStart;
-        for (; arrayEnd < content.size(); ++array_end)
-        {
-            if (content[array_end] == '[') ++depth;
-            else if (content[array_end] == ']')
-            {
-                --depth;
-                if (depth == 0)
-                    break;
-            }
-        }
-        if (array_end >= content.size()) continue;
-
-        std::string arrayText = content.substr(array_start + 1, array_end - array_start - 1);
-        extract_json_objects(arrayText, [&](const std::string& obj) {
-            std::string body = obj.substr(1, obj.size() - 2);
-            ofs << "{\"intersection_id\":\"" << intersectionId << "\"," << body << "}\n";
-        });
+        std::cerr << "IoT Hub send failed" << std::endl;
+        return false;
     }
+
+    IoTHubDeviceClient_LL_DoWork(g_iotHubClient);
+    return true;
 }
 
 void runSocketReceiver(const std::filesystem::path& outputPath, int port = 5000)
@@ -156,7 +150,11 @@ void Gateway::run()
     std::filesystem::path outputFile = std::filesystem::current_path() / "logs" / "jetson_data.jsonl";
     std::filesystem::path jetsonLogsDir = std::filesystem::current_path() / ".." / "jetson-ai" / "logs";
 
-    merge_jetson_logs(jetsonLogsDir, outputFile);
+    std::string payload = router::compute_optimal_route_payload(jetsonLogsDir, outputFile, gateway_intersection_id());
+    if (!send_iot_hub_message(payload))
+    {
+        std::cerr << "Failed to send optimal route payload to Azure IoT Hub" << std::endl;
+    }
 
     std::thread receiver(runSocketReceiver, outputFile, 5000);
 
@@ -165,4 +163,5 @@ void Gateway::run()
         std::this_thread::sleep_for(std::chrono::seconds(1));
 
     receiver.join();
+    cleanup_iot_hub_client();
 }
