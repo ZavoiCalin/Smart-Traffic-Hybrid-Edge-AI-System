@@ -1,4 +1,3 @@
-
 #include <opencv2/opencv.hpp>
 #include <iostream>
 #include <chrono>
@@ -6,16 +5,18 @@
 #include <fstream>
 #include <sstream>
 #include <iomanip>
+#include <vector>
 
 #include "traffic_detector.hpp"
 #include "tracker.hpp"
 
 using namespace std::chrono_literals;
 
-static std::string iso_utc_now()
+static constexpr char kDefaultIntersectionId[] = "iA";
+
+static std::string iso_utc_now(const std::chrono::system_clock::time_point& tp)
 {
-    auto now = std::chrono::system_clock::now();
-    std::time_t t = std::chrono::system_clock::to_time_t(now);
+    auto t = std::chrono::system_clock::to_time_t(tp);
     std::tm tm{};
     // Use thread-safe gmtime_r on Linux/Jetson; fall back to std::gmtime if necessary
     if (gmtime_r(&t, &tm) == nullptr)
@@ -28,10 +29,14 @@ static std::string iso_utc_now()
     return ss.str();
 }
 
-static std::string filename_timestamp()
+static std::string iso_utc_now()
 {
-    auto now = std::chrono::system_clock::now();
-    std::time_t t = std::chrono::system_clock::to_time_t(now);
+    return iso_utc_now(std::chrono::system_clock::now());
+}
+
+static std::string filename_timestamp(const std::chrono::system_clock::time_point& tp)
+{
+    auto t = std::chrono::system_clock::to_time_t(tp);
     std::tm tm{};
     if (gmtime_r(&t, &tm) == nullptr)
     {
@@ -41,6 +46,11 @@ static std::string filename_timestamp()
     std::ostringstream ss;
     ss << std::put_time(&tm, "%Y%m%dT%H%M%SZ");
     return ss.str();
+}
+
+static std::string filename_timestamp()
+{
+    return filename_timestamp(std::chrono::system_clock::now());
 }
 
 static bool atomic_write_json(const std::filesystem::path& path, const std::string& content)
@@ -59,8 +69,28 @@ static bool atomic_write_json(const std::filesystem::path& path, const std::stri
     catch (...) { return false; }
 }
 
-int main()
+int main(int argc, char** argv)
 {
+    std::string intersectionId = kDefaultIntersectionId;
+    if (argc > 1 && argv[1] != nullptr)
+    {
+        intersectionId = argv[1];
+    }
+
+    std::filesystem::path outDir = std::filesystem::current_path() / "jetson-ai";
+    std::filesystem::path logsDir = outDir / "logs";
+    std::error_code ec;
+    std::filesystem::create_directories(logsDir, ec);
+    if (ec)
+    {
+        std::cerr << "Failed to create logs directory: " << ec.message() << std::endl;
+    }
+
+    const std::chrono::seconds logInterval(3);
+    const int maxLogEntries = 30;
+    std::vector<std::string> logEntries;
+    auto lastLog = std::chrono::steady_clock::now();
+
     cv::VideoCapture cap(0);
 
     if (!cap.isOpened())
@@ -74,17 +104,10 @@ int main()
 
     detector.initialize();
 
-    const std::chrono::seconds logInterval(5);
+    const std::chrono::seconds logInterval(3);
+    const int maxLogEntries = 30;
+    std::vector<std::string> logEntries;
     auto lastLog = std::chrono::steady_clock::now();
-
-    std::filesystem::path outDir = std::filesystem::current_path() / "jetson-ai";
-    std::filesystem::path logsDir = outDir / "logs";
-    std::error_code ec;
-    std::filesystem::create_directories(logsDir, ec);
-    if (ec)
-    {
-        std::cerr << "Failed to create logs directory: " << ec.message() << std::endl;
-    }
 
     cv::Mat frame;
 
@@ -118,21 +141,38 @@ int main()
         auto now = std::chrono::steady_clock::now();
         if (now - lastLog >= logInterval)
         {
-                // build minimal json string: {"timestamp":"...","total":N}
-                std::ostringstream ss;
-                ss << "{";
-                ss << "\"timestamp\":\"" << iso_utc_now() << "\",";
-                ss << "\"total\":" << tracks.size();
-                ss << "}";
-
-            auto fname = std::string("log_") + filename_timestamp() + ".json";
-            auto full = logsDir / fname;
-            if (!atomic_write_json(full, ss.str()))
-            {
-                std::cerr << "Failed to write log: " << full.string() << std::endl;
-            }
+            std::ostringstream entry;
+            entry << "{";
+            entry << "\"timestamp\":\"" << iso_utc_now() << "\",";
+            entry << "\"vehicle_count\":" << tracks.size();
+            entry << "}";
+            logEntries.push_back(entry.str());
 
             lastLog = now;
+            if ((int)logEntries.size() >= maxLogEntries)
+            {
+                std::ostringstream ss;
+                ss << "{";
+                ss << "\"" << intersectionId << "\":";
+                ss << "[";
+                for (size_t i = 0; i < logEntries.size(); ++i)
+                {
+                    if (i > 0) ss << ",";
+                    ss << logEntries[i];
+                }
+                ss << "]";
+                ss << "}";
+
+                auto fname = std::string("log_") + intersectionId + "_" + filename_timestamp() + ".json";
+                auto full = logsDir / fname;
+                if (!atomic_write_json(full, ss.str()))
+                {
+                    std::cerr << "Failed to write log: " << full.string() << std::endl;
+                }
+
+                std::cout << "Generated log for intersection " << intersectionId << " with " << logEntries.size() << " entries. Exiting." << std::endl;
+                break;
+            }
         }
 
         if (cv::waitKey(1) == 27)
